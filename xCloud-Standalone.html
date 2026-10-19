@@ -1900,9 +1900,9 @@ body {
       <div id="console-recovery-help" class="console-recovery-help hidden">
         <ol>
           <li>Turn on your Xbox using its power button and wait for it to connect to the internet. If it is already on, restart it.</li>
-          <li>On the console, check Settings → Devices &amp; connections → Remote features → Enable remote features.</li>
+          <li>On the console, open Settings → Devices &amp; connections → Remote features. Turn Enable remote features off and on, then run Test remote play.</li>
           <li>To wake the console remotely later, select Sleep under Settings → General → Power options.</li>
-          <li>Select Try again once the console is online. If it still fails, test Xbox Remote Play to check the console connection.</li>
+          <li>Select Try again once the console is online. If the Xbox Remote Play test also fails, resolve that console connection first.</li>
         </ol>
         <a href="https://support.xbox.com/en-US/help/games-apps/game-setup-and-play/how-to-set-up-remote-play" target="_blank" rel="noopener noreferrer">Xbox Remote Play setup</a>
       </div>
@@ -1990,7 +1990,7 @@ body {
 // The original project's pinned beta7 bundle exports the library here.
 const xLib = window.xCloudPlayer?.ApiClient ? window.xCloudPlayer : window.xCloudPlayer?.default
 if (!xLib?.ApiClient || !xLib?.Player) throw new Error('The embedded Xbox player could not be loaded.')
-const STANDALONE_BUILD = 'standalone-r7'
+const STANDALONE_BUILD = 'standalone-r8'
 
 const $ = (id) => document.getElementById(id)
 
@@ -2760,6 +2760,63 @@ function consoleRegistrationFailure(error) {
     /ErrorCallingWNS|WaitingForServerToRegister/i.test(error.message || '')
 }
 
+async function checkConsolePower(titleId, signal) {
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  if (signal.aborted) throw new DOMException('Cancelled', 'AbortError')
+  signal.addEventListener('abort', cancel, { once: true })
+  try {
+    // A short-lived client lets a slow status check be cancelled without
+    // cancelling the launch. It uses the same home host and account token.
+    const data = await withDeadline(() => createApiClient('home', controller.signal).getConsoles(),
+      5000, 'Checking the console power state timed out.', signal)
+    if (!Array.isArray(data?.results)) throw new Error('Xbox returned an invalid console list.')
+    const console = data.results.find(item => String(item.serverId).toUpperCase() === String(titleId).toUpperCase())
+    return console ? String(console.powerState || 'Unknown').slice(0, 60) : 'Not listed'
+  } finally {
+    controller.abort()
+    signal.removeEventListener('abort', cancel)
+  }
+}
+
+async function waitForConsoleRecovery(titleId, generation, signal, recovery, nextAttempt, maxAttempts) {
+  const began = Date.now(), deadline = Math.min(began + 45000, recovery.deadline)
+  let onlineSince = null
+  while (Date.now() < deadline) {
+    assertCurrent(generation)
+    let power
+    try { power = await checkConsolePower(titleId, signal) }
+    catch(error) {
+      if (signal.aborted || error?.name === 'AbortError' || error.httpStatus === 401 || error.httpStatus === 403) throw error
+      power = 'Check unavailable'
+    }
+    assertCurrent(generation)
+    const now = Date.now()
+    recovery.consolePower = power
+    if (recovery.lastPower !== power) {
+      recovery.consoleChecks.push(Math.round((now - recovery.startedAt) / 1000) + 's: ' + safeErrorText(power))
+      recovery.consoleChecks = recovery.consoleChecks.slice(-12)
+      recovery.lastPower = power
+    }
+    if (/^on$/i.test(power)) {
+      onlineSince ??= now
+      // "On" is only a power report, not proof the streaming server is ready.
+      // Allow startup time even if the service still has an old On report.
+      if (now - began >= 30000 && now - onlineSince >= 10000) return
+      setConnectionStatus('Xbox reports online. Waiting for Remote Play to finish starting…')
+    } else {
+      onlineSince = null
+      setConnectionStatus(power === 'Check unavailable' || power === 'Not listed' || power === 'Unknown'
+        ? 'Waiting for Xbox console registration… You can turn the console on now.'
+        : 'Waiting for your Xbox to come online… You can turn it on now.')
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return
+    $('stream-progress-text').textContent += ' Retry ' + nextAttempt + ' of ' + maxAttempts + ' in up to ' + Math.ceil(remaining / 1000) + ' seconds.'
+    await withDeadline(() => sleep(Math.min(3000, remaining)), 4000, 'Waiting for the console timed out.', signal)
+  }
+}
+
 function bindStreamPolling(stream, client, signal, type) {
   async function exchange(endpoint, interval) {
     const deadline = Date.now() + 45000
@@ -2872,33 +2929,33 @@ async function startStream(type, titleId) {
   $('input-indicator').setAttribute('aria-expanded', 'false')
   showScreen('stream')
   setConnectionStatus('Requesting stream…')
+  const recovery = { startedAt: Date.now(), deadline: Date.now() + 120000, attempt: 0, history: [], consoleChecks: [] }
   try {
     if (!transportReady) throw new Error('The network proxy is not ready. Return to sign-in and retry startup.')
     if (typeof window.RTCPeerConnection !== 'function') throw new Error('This browser cannot play WebRTC streams. Open the page in a current version of Chrome or Edge.')
     const client = createApiClient(type, signal)
-    const maxAttempts = type === 'home' ? 2 : 1
-    const startupHistory = []
+    const maxAttempts = type === 'home' ? 3 : 1
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       assertCurrent(generation)
+      recovery.attempt = attempt
       let stream
       try {
         stream = await client.startStream(type, titleId)
         if (generation !== streamGeneration || signal.aborted) { stream.stop().catch(() => {}); return }
         currentStream = stream
         stream._launchAttempt = attempt
+        stream._startupRecovery = recovery
         bindStreamPolling(stream, client, signal, type)
         setConnectionStatus('Session created. Waiting for Xbox…')
         await watchStream(stream, client, generation, type)
         return
       } catch(error) {
-        error.startupAttempts = attempt
-        error.startupHistory = startupHistory.slice()
         assertCurrent(generation)
+        recovery.history.push('Attempt ' + attempt + ' at ' + Math.round((Date.now() - recovery.startedAt) / 1000) + 's: ' + (error.serverState || 'unknown state') + ' — ' + safeErrorText(error.message))
         // Only retry the known console-notification failure before media
         // starts. Failed sessions cannot be resumed; close before a new play.
-        if (type !== 'home' || attempt >= maxAttempts || player || !consoleRegistrationFailure(error)) throw error
-        startupHistory.push('Attempt ' + attempt + ': ' + (error.serverState || 'unknown state') + ' — ' + safeErrorText(error.message))
-        setConnectionStatus('Xbox could not reach the console. Retrying once…')
+        if (type !== 'home' || attempt >= maxAttempts || player || !consoleRegistrationFailure(error) || Date.now() >= recovery.deadline) throw error
+        setConnectionStatus('Xbox is not ready for Remote Play. Allowing the console time to start…')
         if (stream) {
           if (currentStream === stream) currentStream = null
           try {
@@ -2907,12 +2964,16 @@ async function startStream(type, titleId) {
             if (cleanupError?.name === 'AbortError') throw cleanupError
           }
         }
-        await withDeadline(() => sleep(4000), 5000, 'Waiting to retry console startup timed out.', signal)
+        await waitForConsoleRecovery(titleId, generation, signal, recovery, attempt + 1, maxAttempts)
         assertCurrent(generation)
-        setConnectionStatus('Requesting console stream again (2 of 2)…')
+        if (Date.now() >= recovery.deadline) throw error
+        setConnectionStatus('Requesting console stream again (' + (attempt + 1) + ' of ' + maxAttempts + ')…')
       }
     }
-  } catch(error) { failStream(error, generation) }
+  } catch(error) {
+    error.startupRecovery = recovery
+    failStream(error, generation)
+  }
 }
 
 function decodeExchange(response) {
@@ -3100,22 +3161,28 @@ function releaseStream() {
 function failStream(error, generation) {
   if (generation !== streamGeneration || error?.name === 'AbortError') return
   const registrationFailed = lastLaunch?.type === 'home' && consoleRegistrationFailure(error)
+  const recovery = error.startupRecovery || currentStream?._startupRecovery
   const message = registrationFailed
-    ? 'Xbox could not contact your console to start Remote Play. Turn the console on or restart it, then try again.'
+    ? 'Your Xbox did not register for Remote Play after ' + (recovery?.attempt || 1) + ' startup attempts. Turn it on or restart it, then check Remote features.'
     : error?.message || 'The stream could not be started.'
   const pc = player?._peerConnection
   const candidates = player?.getIceCandidates() || []
   const states = [...(currentStream?._startupStates || [])]
   if (error.serverState && states.at(-1) !== error.serverState) states.push(error.serverState)
   const networkDetails = [
-    'Startup attempts: ' + (error.startupAttempts || currentStream?._launchAttempt || 1),
+    'Startup attempts: ' + (recovery?.attempt || error.startupAttempts || currentStream?._launchAttempt || 1),
+    ...(lastLaunch?.type === 'home' ? [
+      'Startup elapsed: ' + (recovery ? Math.round((Date.now() - recovery.startedAt) / 1000) + 's' : 'not recorded'),
+      'Console power: ' + (recovery?.consolePower || 'not checked'),
+      'Console checks: ' + (recovery?.consoleChecks.join(' -> ') || 'not checked')
+    ] : []),
     'Server states: ' + (states.join(' -> ') || 'not received'),
     'Detailed session state: ' + (error.detailedSessionState ?? 'not received'),
     'WebRTC: ' + (pc?.connectionState || 'not created'),
     'ICE: ' + (pc?.iceConnectionState || 'not created') + ' / ' + (pc?.iceGatheringState || 'not gathering'),
     'Routes: ' + candidates.length + ' (' + candidates.filter(candidate => candidate.type === 'relay').length + ' relay)',
     'Network Unblocker: ' + (turnEnabled ? 'ON' : 'OFF'),
-    ...(error.startupHistory || [])
+    ...(recovery?.history || error.startupHistory || [])
   ].join('\n')
   releaseStream()
   setConnectionStatus(message, 'error')
